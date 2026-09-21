@@ -51,10 +51,19 @@ def init_db():
             expires_at REAL,
             max_downloads INTEGER,
             download_count INTEGER DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'active',
+            deleted_at REAL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
         )
     ''')
+
+    # 已有库的轻量迁移：补齐分享管理所需的状态列
+    columns = [row['name'] for row in cursor.execute("PRAGMA table_info(share_links)")]
+    if 'status' not in columns:
+        cursor.execute("ALTER TABLE share_links ADD COLUMN status TEXT NOT NULL DEFAULT 'active'")
+    if 'deleted_at' not in columns:
+        cursor.execute("ALTER TABLE share_links ADD COLUMN deleted_at REAL")
 
     default_users = [
         ('admin', hashlib.sha256('admin123'.encode()).hexdigest()),

@@ -66,6 +66,8 @@ async function updateUserBar() {
 // 退出登录
 function logout() {
     TokenManager.clear();
+    selectedShareIds.clear();
+    lastSharesCache = [];
     updateUserBar();
 }
 
@@ -154,14 +156,19 @@ uploadZone.addEventListener('drop', async (e) => {
 // 加载文件列表
 async function loadFileList() {
     showLoading('加载文件列表...');
-    
+
     try {
-        const response = await fetch(`${API_BASE}/files`);
+        // 携带 token 时后端会附带每个文件本人的分享状态摘要
+        const headers = {};
+        if (TokenManager.get()) {
+            headers['Authorization'] = `Bearer ${TokenManager.get()}`;
+        }
+        const response = await fetch(`${API_BASE}/files`, { headers });
         const files = await response.json();
-        
+
         const fileList = document.getElementById('fileList');
         const isLoggedIn = TokenManager.get() && (await TokenManager.isValid());
-        
+
         if (files.length === 0) {
             fileList.innerHTML = '<p class="empty-msg">暂无可下载文件</p>';
         } else {
@@ -172,6 +179,7 @@ async function loadFileList() {
                         <div class="file-details">
                             <div class="file-name">${escapeHtml(file.name)}</div>
                             <div class="file-size">${formatSize(file.size)}</div>
+                            ${renderFileShareBadge(file.my_shares)}
                         </div>
                     </div>
                     <div class="file-actions">
@@ -184,11 +192,21 @@ async function loadFileList() {
             `).join('');
         }
     } catch (error) {
-        document.getElementById('fileList').innerHTML = 
+        document.getElementById('fileList').innerHTML =
             `<p class="empty-msg">加载失败: ${escapeHtml(error.message)}</p>`;
     } finally {
         hideLoading();
     }
+}
+
+// 文件目录中的分享状态徽章（与我的分享管理状态同步）
+function renderFileShareBadge(summary) {
+    if (!summary) return '';
+    const parts = [];
+    if (summary.active > 0) parts.push(`🔗 分享中 ${summary.active}`);
+    if (summary.disabled > 0) parts.push(`⏸️ 已停用 ${summary.disabled}`);
+    if (parts.length === 0) return '';
+    return `<div class="file-share-badge">${parts.join(' · ')}</div>`;
 }
 
 // HTML转义防止XSS
@@ -507,70 +525,227 @@ async function copyShareLink() {
     }
 }
 
-// 加载我的分享列表
+// ==================== 我的分享管理 ====================
+
+// 勾选选择集：跨列表刷新保留原选择
+const selectedShareIds = new Set();
+// 状态筛选标签：跨会话保留（返回列表时恢复原选择）
+let shareFilter = localStorage.getItem('share_filter') || 'all';
+// 最近一次加载的分享数据缓存，用于筛选切换时本地重渲染
+let lastSharesCache = [];
+
+// 加载我的分享列表（含他人只读记录与本人已删除记录）
 async function loadMyShares() {
     const section = document.getElementById('mySharesSection');
     const list = document.getElementById('mySharesList');
-    
+
     if (!(await TokenManager.isValid())) {
         section.style.display = 'none';
         return;
     }
-    
+
     section.style.display = 'block';
-    
+    applyShareFilterTabs();
+
     try {
-        const response = await fetch(`${API_BASE}/shares`, {
+        const response = await fetch(`${API_BASE}/shares?scope=all&include_deleted=1`, {
             headers: {
                 'Authorization': `Bearer ${TokenManager.get()}`
             }
         });
-        
-        const shares = await response.json();
-        
-        if (shares.length === 0) {
-            list.innerHTML = '<p class="empty-msg">暂无分享链接</p>';
+
+        if (!response.ok) {
+            const result = await response.json().catch(() => ({}));
+            list.innerHTML = `<p class="empty-msg">加载失败: ${escapeHtml(result.error || response.statusText)}</p>`;
             return;
         }
-        
-        list.innerHTML = shares.map(share => {
-            const statusClass = share.is_valid ? 'valid' : 'invalid';
-            const statusText = share.is_valid ? '有效' : (share.error_msg || '无效');
-            
-            return `
-                <div class="share-item">
-                    <div class="share-item-header">
-                        <span class="share-item-filename">${escapeHtml(share.filename)}</span>
-                        <span class="share-item-status ${statusClass}">${statusText}</span>
-                    </div>
-                    <div class="share-item-details">
-                        <div class="share-item-detail">
-                            <span class="share-item-detail-label">剩余时间</span>
-                            <span class="share-item-detail-value">${formatRemainingTime(share.expires_at)}</span>
-                        </div>
-                        <div class="share-item-detail">
-                            <span class="share-item-detail-label">已下载</span>
-                            <span class="share-item-detail-value">${share.download_count} / ${share.max_downloads || '∞'}</span>
-                        </div>
-                        <div class="share-item-detail">
-                            <span class="share-item-detail-label">创建时间</span>
-                            <span class="share-item-detail-value">${new Date(share.created_at).toLocaleString('zh-CN')}</span>
-                        </div>
-                    </div>
-                    <div class="share-item-actions">
-                        <button class="copy-link-btn" onclick="copyShareLinkFromList('${share.share_id}')">
-                            🔗 复制链接
-                        </button>
-                        <button class="delete-share-btn" onclick="deleteShare('${share.share_id}')">
-                            🗑️ 删除
-                        </button>
-                    </div>
-                </div>
-            `;
-        }).join('');
+
+        const shares = await response.json();
+        lastSharesCache = shares;
+
+        // 仅移除选择集中已不可管理的记录，保留其余原选择
+        const manageableIds = new Set(shares.filter(s => s.can_manage).map(s => s.share_id));
+        for (const id of [...selectedShareIds]) {
+            if (!manageableIds.has(id)) {
+                selectedShareIds.delete(id);
+            }
+        }
+
+        renderShareList(shares);
     } catch (error) {
         list.innerHTML = `<p class="empty-msg">加载失败: ${escapeHtml(error.message)}</p>`;
     }
+}
+
+// 渲染分享列表（应用当前筛选，并恢复勾选状态）
+function renderShareList(shares) {
+    const list = document.getElementById('mySharesList');
+    const filtered = shares.filter(matchShareFilter);
+
+    if (filtered.length === 0) {
+        list.innerHTML = shares.length === 0
+            ? '<p class="empty-msg">暂无分享链接</p>'
+            : '<p class="empty-msg">当前筛选条件下暂无分享记录</p>';
+        updateBulkBar();
+        return;
+    }
+
+    list.innerHTML = filtered.map(share => renderShareItem(share)).join('');
+
+    // 恢复勾选状态，保留原选择
+    list.querySelectorAll('.share-select').forEach(checkbox => {
+        checkbox.checked = selectedShareIds.has(checkbox.dataset.shareId);
+    });
+    updateBulkBar();
+}
+
+// 筛选条件匹配
+function matchShareFilter(share) {
+    const isDeleted = share.deleted_at !== null;
+    switch (shareFilter) {
+        case 'valid': return !isDeleted && share.is_valid;
+        case 'disabled': return !isDeleted && share.status === 'disabled';
+        case 'deleted': return isDeleted;
+        default: return true;
+    }
+}
+
+// 渲染单条分享记录：区分本人可管理、他人只读、已删除三种状态
+function renderShareItem(share) {
+    const isDeleted = share.deleted_at !== null;
+
+    let statusClass, statusText;
+    if (isDeleted) {
+        statusClass = 'deleted';
+        statusText = '已删除';
+    } else if (share.status === 'disabled') {
+        statusClass = 'disabled';
+        statusText = '已停用';
+    } else if (share.is_valid) {
+        statusClass = 'valid';
+        statusText = '有效';
+    } else {
+        statusClass = 'invalid';
+        statusText = share.error_msg || '无效';
+    }
+
+    // 归属标识
+    let ownerBadge = '';
+    if (!isDeleted) {
+        ownerBadge = share.can_manage
+            ? '<span class="share-owner-badge own">本人创建</span>'
+            : `<span class="share-owner-badge readonly">👤 ${escapeHtml(share.created_by)} · 只读</span>`;
+    }
+
+    // 仅本人可管理的记录可勾选
+    const checkbox = share.can_manage
+        ? `<input type="checkbox" class="share-select" data-share-id="${share.share_id}"
+                   onchange="toggleShareSelection('${share.share_id}', this.checked)">`
+        : '';
+
+    // 操作区：本人可管理才有操作；他人只读与已删除仅展示说明
+    let actions;
+    if (share.can_manage) {
+        const toggleBtn = share.status === 'disabled'
+            ? `<button class="restore-share-btn" onclick="toggleShareStatus('${share.share_id}', 'restore')">♻️ 恢复</button>`
+            : `<button class="disable-share-btn" onclick="toggleShareStatus('${share.share_id}', 'disable')">⏸️ 停用</button>`;
+        actions = `
+            <button class="copy-link-btn" onclick="copyShareLinkFromList('${share.share_id}')">
+                🔗 复制链接
+            </button>
+            ${toggleBtn}
+            <button class="delete-share-btn" onclick="deleteShare('${share.share_id}')">
+                🗑️ 删除
+            </button>`;
+    } else if (isDeleted) {
+        actions = '<span class="readonly-hint">记录已删除，可通过「清理历史」彻底移除</span>';
+    } else {
+        actions = '<span class="readonly-hint">他人创建的分享，仅可查看</span>';
+    }
+
+    return `
+        <div class="share-item ${isDeleted ? 'share-item-deleted' : ''}">
+            <div class="share-item-header">
+                <span class="share-item-title">
+                    ${checkbox}
+                    <span class="share-item-filename">${escapeHtml(share.filename)}</span>
+                    ${ownerBadge}
+                </span>
+                <span class="share-item-status ${statusClass}">${statusText}</span>
+            </div>
+            <div class="share-item-details">
+                <div class="share-item-detail">
+                    <span class="share-item-detail-label">剩余时间</span>
+                    <span class="share-item-detail-value">${formatRemainingTime(share.expires_at)}</span>
+                </div>
+                <div class="share-item-detail">
+                    <span class="share-item-detail-label">已下载</span>
+                    <span class="share-item-detail-value">${share.download_count} / ${share.max_downloads || '∞'}</span>
+                </div>
+                <div class="share-item-detail">
+                    <span class="share-item-detail-label">创建时间</span>
+                    <span class="share-item-detail-value">${new Date(share.created_at).toLocaleString('zh-CN')}</span>
+                </div>
+            </div>
+            <div class="share-item-actions">
+                ${actions}
+            </div>
+        </div>
+    `;
+}
+
+// 越权/并发场景的明确错误描述
+function describeShareError(status, result) {
+    if (status === 403) {
+        return '无权限操作：该分享不属于当前账号，操作已中止';
+    }
+    if (status === 404) {
+        return '该分享不存在或已被删除（可能已被其他会话操作）';
+    }
+    return result.error || '未知错误';
+}
+
+// 在分享管理区展示操作结果反馈
+function showShareFeedback(message, type) {
+    const feedback = document.getElementById('shareManageFeedback');
+    feedback.textContent = message;
+    feedback.className = `share-feedback ${type}`;
+    feedback.style.display = 'block';
+}
+
+// 切换勾选状态
+function toggleShareSelection(shareId, checked) {
+    if (checked) {
+        selectedShareIds.add(shareId);
+    } else {
+        selectedShareIds.delete(shareId);
+    }
+    updateBulkBar();
+}
+
+// 更新批量操作栏
+function updateBulkBar() {
+    const btn = document.getElementById('deleteSelectedBtn');
+    if (!btn) return;
+    btn.disabled = selectedShareIds.size === 0;
+    btn.textContent = selectedShareIds.size > 0
+        ? `删除所选 (${selectedShareIds.size})`
+        : '删除所选';
+}
+
+// 切换筛选标签（选择持久化，返回列表时保留）
+function setShareFilter(filter) {
+    shareFilter = filter;
+    localStorage.setItem('share_filter', filter);
+    applyShareFilterTabs();
+    renderShareList(lastSharesCache);
+}
+
+// 同步筛选标签的激活样式
+function applyShareFilterTabs() {
+    document.querySelectorAll('.share-filter-tab').forEach(tab => {
+        tab.classList.toggle('active', tab.dataset.filter === shareFilter);
+    });
 }
 
 // 从分享列表复制链接
@@ -578,9 +753,38 @@ async function copyShareLinkFromList(shareId) {
     const link = `${window.location.origin}/share.html#${shareId}`;
     try {
         await navigator.clipboard.writeText(link);
-        alert('分享链接已复制到剪贴板');
+        showShareFeedback('✅ 分享链接已复制到剪贴板', 'success');
     } catch (error) {
         prompt('请手动复制链接:', link);
+    }
+}
+
+// 停用 / 恢复分享链接
+async function toggleShareStatus(shareId, action) {
+    const actionText = action === 'disable' ? '停用' : '恢复';
+    showLoading(`${actionText}中...`);
+
+    try {
+        const response = await fetch(`${API_BASE}/share/${shareId}/${action}`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${TokenManager.get()}`
+            }
+        });
+        const result = await response.json().catch(() => ({}));
+
+        if (response.ok) {
+            showShareFeedback(`✅ ${result.message || `分享链接已${actionText}`}`, 'success');
+        } else {
+            showShareFeedback(`❌ ${actionText}失败: ${describeShareError(response.status, result)}`, 'error');
+        }
+    } catch (error) {
+        showShareFeedback(`❌ ${actionText}失败: ${error.message}`, 'error');
+    } finally {
+        hideLoading();
+        // 刷新分享列表（保留原选择）并同步文件目录状态
+        await loadMyShares();
+        loadFileList();
     }
 }
 
@@ -589,9 +793,9 @@ async function deleteShare(shareId) {
     if (!confirm('确定要删除此分享链接吗？删除后链接将立即失效。')) {
         return;
     }
-    
+
     showLoading('删除中...');
-    
+
     try {
         const response = await fetch(`${API_BASE}/share/${shareId}`, {
             method: 'DELETE',
@@ -599,17 +803,99 @@ async function deleteShare(shareId) {
                 'Authorization': `Bearer ${TokenManager.get()}`
             }
         });
-        
+        const result = await response.json().catch(() => ({}));
+
         if (response.ok) {
-            loadMyShares();
+            selectedShareIds.delete(shareId);
+            showShareFeedback('✅ 分享链接已删除，可通过「清理历史」彻底移除记录', 'success');
         } else {
-            const result = await response.json();
-            alert(`删除失败: ${result.error || '未知错误'}`);
+            showShareFeedback(`❌ 删除失败: ${describeShareError(response.status, result)}`, 'error');
         }
     } catch (error) {
-        alert(`删除失败: ${error.message}`);
+        showShareFeedback(`❌ 删除失败: ${error.message}`, 'error');
     } finally {
         hideLoading();
+        await loadMyShares();
+        loadFileList();
+    }
+}
+
+// 批量删除所选分享（逐项执行，汇总明确结果）
+async function deleteSelectedShares() {
+    const ids = [...selectedShareIds];
+    if (ids.length === 0) return;
+
+    if (!confirm(`确定要删除选中的 ${ids.length} 个分享链接吗？`)) {
+        return;
+    }
+
+    showLoading('批量删除中...');
+    let succeeded = 0;
+    const failures = [];
+
+    for (const shareId of ids) {
+        try {
+            const response = await fetch(`${API_BASE}/share/${shareId}`, {
+                method: 'DELETE',
+                headers: {
+                    'Authorization': `Bearer ${TokenManager.get()}`
+                }
+            });
+            if (response.ok) {
+                succeeded++;
+                selectedShareIds.delete(shareId);
+            } else {
+                const result = await response.json().catch(() => ({}));
+                failures.push(describeShareError(response.status, result));
+            }
+        } catch (error) {
+            failures.push(error.message);
+        }
+    }
+
+    hideLoading();
+
+    if (failures.length === 0) {
+        showShareFeedback(`✅ 已删除 ${succeeded} 个分享链接`, 'success');
+    } else {
+        showShareFeedback(
+            `⚠️ 已删除 ${succeeded} 个，${failures.length} 个失败：${failures[0]}`,
+            'error'
+        );
+    }
+
+    await loadMyShares();
+    loadFileList();
+}
+
+// 清理历史分享（已删除 / 已过期 / 次数用完的本人记录）
+async function cleanupShares() {
+    if (!confirm('清理历史将彻底移除已删除、已过期或下载次数用完的分享记录，确定继续吗？')) {
+        return;
+    }
+
+    showLoading('清理历史分享...');
+
+    try {
+        const response = await fetch(`${API_BASE}/shares/cleanup`, {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${TokenManager.get()}`
+            }
+        });
+        const result = await response.json().catch(() => ({}));
+
+        if (response.ok) {
+            showShareFeedback(`✅ ${result.message}`, 'success');
+        } else {
+            showShareFeedback(`❌ 清理失败: ${describeShareError(response.status, result)}`, 'error');
+        }
+    } catch (error) {
+        showShareFeedback(`❌ 清理失败: ${error.message}`, 'error');
+    } finally {
+        hideLoading();
+        await loadMyShares();
+        loadFileList();
     }
 }
 

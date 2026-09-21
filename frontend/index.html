@@ -51,6 +51,23 @@
         <!-- 我的分享 -->
         <div id="mySharesSection" class="file-list-section" style="display: none;">
             <h2>我的分享</h2>
+            <div class="share-toolbar">
+                <div class="share-filter-tabs" id="shareFilterTabs">
+                    <button class="share-filter-tab active" data-filter="all" onclick="setShareFilter('all')">全部</button>
+                    <button class="share-filter-tab" data-filter="valid" onclick="setShareFilter('valid')">有效</button>
+                    <button class="share-filter-tab" data-filter="disabled" onclick="setShareFilter('disabled')">已停用</button>
+                    <button class="share-filter-tab" data-filter="deleted" onclick="setShareFilter('deleted')">已删除</button>
+                </div>
+                <div class="share-bulk-actions">
+                    <button class="bulk-btn" id="deleteSelectedBtn" onclick="deleteSelectedShares()" disabled>
+                        删除所选
+                    </button>
+                    <button class="bulk-btn cleanup-btn" onclick="cleanupShares()">
+                        🧹 清理历史
+                    </button>
+                </div>
+            </div>
+            <div id="shareManageFeedback" class="share-feedback" style="display: none;"></div>
             <div id="mySharesList" class="share-list"></div>
         </div>
 
